@@ -7,39 +7,54 @@
 #include <tusb.h>
 #include <common/tusb_types.h>
 
-LOG_MODULE_REGISTER(max3421e, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(antrower, LOG_LEVEL_DBG);
 
 static void max3421_init(void);
 void cdc_app_task();
 static nrfx_spi_t _spi = NRFX_SPI_INSTANCE(1);
 static nrfx_gpiote_t _gpiote = NRFX_GPIOTE_INSTANCE(0);
 
+static void timeout_handler(struct k_timer *timer_id);
+static K_TIMER_DEFINE(timer, timeout_handler, NULL);
+
 #define LFCLK_SRC_RC CLOCK_LFCLKSRC_SRC_RC
 #define VBUSDETECT_Msk POWER_USBREGSTATUS_VBUSDETECT_Msk
 #define OUTPUTRDY_Msk POWER_USBREGSTATUS_OUTPUTRDY_Msk
 
+#define TIMER_TICK_MS       (1)
+
+#define WR_REQ_CONNECT "USB\r\n"
+#define WR_REQ_RESET "RESET\r\n"
+#define WR_REQ_EXIT "EXIT\r\n"
+#define WR_REQ_MODEL "IV?\r\n"
+
+#define WR_RES_CONNECT "_WR_\r\n"
+#define WR_RES_PING "PING\r\n"
+#define WR_RES_MODEL "IV40210\r\n"
+
+uint8_t pingCount = 0;
+uint8_t irqTimer = 0;
+
 int main(void)
 {
-        max3421_init();
+  max3421_init();
 
-        tusb_rhport_init_t host_init = {
-                .role = TUSB_ROLE_HOST,
-                .speed = TUSB_SPEED_AUTO
-        };
-        
-        tusb_init(0, &host_init); // initialize host stack on roothub port 0
+  tusb_rhport_init_t host_init = {
+    .role = TUSB_ROLE_HOST,
+    .speed = TUSB_SPEED_AUTO
+  };
+  
+  tusb_init(BOARD_TUH_RHPORT, &host_init); // initialize host stack on roothub port 0
 
-        // FeatherWing MAX3421E use MAX3421E's GPIO0 for VBUS enable
-        enum { IOPINS1_ADDR  = 20u << 3, /* 0xA0 */ };
-        tuh_max3421_reg_write(BOARD_TUH_RHPORT, IOPINS1_ADDR, 0x01, false);
+  // FeatherWing MAX3421E use MAX3421E's GPIO0 for VBUS enable
+  enum { IOPINS1_ADDR  = 20u << 3, /* 0xA0 */ };
+  tuh_max3421_reg_write(BOARD_TUH_RHPORT, IOPINS1_ADDR, 0x01, false);
 
-        while(1) {
-                tuh_task();
+  while(1) {
+    tuh_task();
+  }
 
-                //cdc_app_task();
-        }
-
-        return 0;
+  return 0;
 }
 
 /////////////////////////////////////// CALLBACKS ///////////////////////////////////////
@@ -50,12 +65,13 @@ void tuh_mount_cb(uint8_t dev_addr) {
 
 void tuh_umount_cb(uint8_t dev_addr) {
   // application tear-down
+  irqTimer = 0;
   LOG_INF("A device with address %u is unmounted", dev_addr);
 }
 
-void cdc_app_task(void) {
-  uint8_t buf[] = "USB\r\n"; // +1 for extra null character
-  uint32_t const bufsize = sizeof(buf) - 1;
+void cdc_app_task(uint8_t* buf) {
+  //uint8_t buf[] = "USB\r\n"; // +1 for extra null character
+  uint32_t const bufsize = strlen(buf);
 
   // loop over all mounted interfaces
   for (uint8_t idx = 0; idx < CFG_TUH_CDC; idx++) {
@@ -81,8 +97,10 @@ void tuh_cdc_mount_cb(uint8_t idx) {
     LOG_INF("  Parity  : %u, Data Width: %u", line_coding.parity, line_coding.data_bits);
   }
 
+  irqTimer = 20;
+
   // FOR TESTING!!!
-  cdc_app_task();
+  cdc_app_task(WR_REQ_CONNECT);
 }
 
 void tuh_cdc_umount_cb(uint8_t idx) {
@@ -91,6 +109,8 @@ void tuh_cdc_umount_cb(uint8_t idx) {
 
   LOG_INF("CDC Interface is unmounted: address = %u, itf_num = %u", itf_info.daddr,
          itf_info.desc.bInterfaceNumber);
+
+  irqTimer = 0;
 }
 
 void tuh_cdc_rx_cb(uint8_t idx) {
@@ -103,6 +123,16 @@ void tuh_cdc_rx_cb(uint8_t idx) {
     buf[count] = 0;
     LOG_INF("response: %s", (char*) buf);
     fflush(stdout);
+    
+    if(strcmp((char*)buf, WR_RES_CONNECT) == 0) {
+        cdc_app_task(WR_REQ_MODEL);
+    }
+    if(strcmp((char*)buf, WR_RES_PING) == 0) {
+        if(++pingCount == 5) {
+            pingCount = 0;
+            cdc_app_task(WR_REQ_EXIT);
+        }
+    }
   }
 }
 
@@ -116,7 +146,20 @@ void max3421_int_handler(nrfx_gpiote_pin_t pin, nrfx_gpiote_trigger_t action, vo
     return;
   }
 
-  tusb_int_handler(0, true);
+  //if(irqTimer == 0) {
+  //if(!is_nak(BOARD_TUH_RHPORT))
+  if(irqTimer == 0)
+  {
+    tusb_int_handler(BOARD_TUH_RHPORT, true);
+  }
+  else {
+    k_timer_start(&timer, K_MSEC(20), K_NO_WAIT);
+  }
+}
+
+static void timeout_handler(struct k_timer *timer_id)
+{
+  tusb_int_handler(BOARD_TUH_RHPORT, true); 
 }
 
 static void max3421_init(void) {
